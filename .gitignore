@@ -1,0 +1,19 @@
+# --- Geospatial & generated data ---
+*.tif
+*.tiff
+*.gpkg
+*.pdf
+
+# --- Python & Environment ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# --- Secrets (API keys, settings) ---
+.env
+
+# --- OS System Files ---
+.DS_Store
+Thumbs.db
