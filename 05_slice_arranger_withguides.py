@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 # --- CONFIGURATION ---
 INPUT_FILE = "Jungfraujoch10km_custom_crop.gpkg"
-OUTPUT_PDF = "Jungfraujoch10km_custom_crop_printable.pdf"
+OUTPUT_PDF = "Jungfraujoch10km_with_guides_fixed.pdf"
 MODEL_SCALE = 1/56000 
 TEST_LIMIT = None 
 
@@ -23,7 +23,6 @@ MIN_AREA_MM2 = 25.0
 SCALE_BAR_REAL_KM = 1.0
 
 def get_optimal_rotation(geom):
-    """Finds angle to align Minimum Rotated Rectangle with X-axis."""
     rect = geom.minimum_rotated_rectangle
     coords = list(rect.exterior.coords)
     max_len = -1.0
@@ -45,13 +44,11 @@ def rotate_point(point, angle_degrees):
     return (new_x, new_y)
 
 def main():
-    # 1. SETUP
     print(f"Loading {INPUT_FILE}...")
     gdf = gpd.read_file(INPUT_FILE)
     
-    # Identify unique levels to find the "next" layer
     unique_levels = sorted(gdf['elevation'].unique())
-    level_map = {lvl: unique_levels[i+1] for i, lvl in enumerate(unique_levels[:-1])} # map current -> next
+    level_map = {lvl: unique_levels[i+1] for i, lvl in enumerate(unique_levels[:-1])} 
 
     print_w = PAPER_WIDTH_MM - 2 * MARGIN_MM
     print_h = PAPER_HEIGHT_MM - 2 * MARGIN_MM
@@ -67,10 +64,7 @@ def main():
     shapes = []
     skipped_count = 0
     
-    print(f"Processing shapes & Finding Guides (Min Area: {MIN_AREA_MM2} mm²)...")
-    
-    # We convert the entire GDF to a list of dicts first to make lookups easier if needed, 
-    # but spatial queries on the GDF are fast enough.
+    print(f"Processing shapes & Finding Guides...")
     
     for idx, row in tqdm(gdf.iterrows(), total=len(gdf), desc="Processing"):
         geom = row.geometry
@@ -82,53 +76,40 @@ def main():
             if coords[0] != coords[-1]: coords.append(coords[0])
             geom = Polygon(coords)
             
-        # --- NEW: FIND GUIDE SHAPES (Next Layer Up) ---
+        # FIND GUIDE SHAPES
         guide_geoms = []
         if elev in level_map:
             next_elev = level_map[elev]
-            # Filter GDF for the next layer
             next_layer = gdf[gdf['elevation'] == next_elev]
-            # Find shapes in next layer that intersect/overlap current shape
-            # We use a small buffer(-0.1) on current shape to avoid edge-touching issues
             potential_guides = next_layer[next_layer.geometry.intersects(geom)]
             
             for _, guide_row in potential_guides.iterrows():
                 g_geom = guide_row.geometry
-                # Close guide if needed
                 if isinstance(g_geom, LineString):
                     gc = list(g_geom.coords)
                     if gc[0] != gc[-1]: gc.append(gc[0])
                     g_geom = Polygon(gc)
-                # Clip the guide to the current shape (just in case of weird overlaps)
-                # Usually intersection is enough
                 intersection = g_geom.intersection(geom)
                 if not intersection.is_empty:
                     guide_geoms.append(intersection)
 
-        # B. SCALE TO MM (Main + Guides)
+        # B. SCALE TO MM
         geom = affinity.scale(geom, xfact=MODEL_SCALE*1000, yfact=MODEL_SCALE*1000, origin=(0,0))
-        scaled_guides = []
-        for g in guide_geoms:
-            sg = affinity.scale(g, xfact=MODEL_SCALE*1000, yfact=MODEL_SCALE*1000, origin=(0,0))
-            scaled_guides.append(sg)
+        scaled_guides = [affinity.scale(g, xfact=MODEL_SCALE*1000, yfact=MODEL_SCALE*1000, origin=(0,0)) for g in guide_geoms]
         
-        # Filter Small Areas
         if geom.area < MIN_AREA_MM2:
             skipped_count += 1
             continue
         
-        # C. OPTIMIZE ROTATION (Main + Guides)
+        # C. OPTIMIZE ROTATION
         rot_angle = get_optimal_rotation(geom)
         centroid = geom.centroid
         
         # Rotate Main
         optimized_geom = affinity.rotate(geom, rot_angle, origin=centroid)
         
-        # Rotate Guides (Must use SAME origin and angle)
-        optimized_guides = []
-        for sg in scaled_guides:
-            og = affinity.rotate(sg, rot_angle, origin=centroid)
-            optimized_guides.append(og)
+        # Rotate Guides (CRITICAL: Use Main Shape Centroid)
+        optimized_guides = [affinity.rotate(g, rot_angle, origin=centroid) for g in scaled_guides]
             
         north_vector = rotate_point((0, 1), rot_angle)
         
@@ -137,11 +118,9 @@ def main():
         w = maxx - minx
         h = maxy - miny
         
-        # --- SIZE CHECK ---
-        fits_portrait = (w <= print_w and h <= print_h)
-        fits_landscape = (w <= print_h and h <= print_w)
+        # E. CHECK FIT
         
-        if not (fits_portrait or fits_landscape):
+        if not ((w <= print_w and h <= print_h) or (w <= print_h and h <= print_w)):
             print(f"ERROR: Shape at {elev}m is TOO BIG for the paper! Shape Size: {w:.1f}mm x {h:.1f}mm. Paper Size: {print_w}mm x {print_h}mm")
             
             shape_min = min(w, h)
@@ -160,12 +139,10 @@ def main():
         shapes.append({
             'id': idx,
             'geom': optimized_geom, 
-            'guides': optimized_guides, # Store the dashed lines
+            'guides': optimized_guides,
             'w': w,
             'h': h,
             'elev': elev,
-            'original_minx': minx,
-            'original_miny': miny,
             'north_vector': north_vector
         })
 
@@ -210,6 +187,8 @@ def main():
             count = 0
             for rect in abin:
                 shape_data = shapes[rect.rid]
+                
+                # Target Position on Paper
                 place_x = rect.x / PRECISION + MARGIN_MM
                 place_y = rect.y / PRECISION + MARGIN_MM
                 
@@ -220,53 +199,42 @@ def main():
                 # Check 90 deg rotation by packer
                 packed_w_int = int(rect.width)
                 orig_w_int = int(shape_data['w'] * PRECISION)
+                is_rotated_90 = abs(packed_w_int - orig_w_int) > 1
                 
-                rotated_90 = abs(packed_w_int - orig_w_int) > 1
+                # --- CRITICAL FIX: UNIFIED TRANSFORMATION ---
+                # 1. Apply Rotation (if needed) to EVERYTHING around the MAIN CENTROID
+                main_centroid = poly.centroid
                 
-                # Apply Packer Transformations to Main Poly AND Guides
-                def transform_for_packing(geometry_obj, is_rotated_90, origin_minx, origin_miny, px, py):
-                    g = geometry_obj
-                    if is_rotated_90:
-                        g = affinity.rotate(g, 90, origin='centroid')
-                        # If rotated, bounds change, so we re-zero based on new bounds
-                        mnx, mny, _, _ = g.bounds
-                        g = affinity.translate(g, xoff=-mnx, yoff=-mny)
-                    else:
-                        g = affinity.translate(g, xoff=-origin_minx, yoff=-origin_miny)
-                    
-                    # Move to final position
-                    g = affinity.translate(g, xoff=px, yoff=py)
-                    return g
-
-                # 1. Transform Main Poly
-                poly = transform_for_packing(poly, rotated_90, shape_data['original_minx'], shape_data['original_miny'], place_x, place_y)
-                
-                # 2. Transform North Vector
-                if rotated_90:
+                if is_rotated_90:
+                    poly = affinity.rotate(poly, 90, origin=main_centroid)
+                    # Rotate guides around the MAIN SHAPE'S centroid to keep relative position
+                    guides = [affinity.rotate(g, 90, origin=main_centroid) for g in guides]
                     n_vec = rotate_point(n_vec, 90)
 
-                # 3. Transform All Guides
-                final_guides = []
-                for g in guides:
-                    # Note: Guides must be transformed relative to the Main Poly's original bounds
-                    # The logic is identical because they share the same coordinate space/origin
-                    fg = transform_for_packing(g, rotated_90, shape_data['original_minx'], shape_data['original_miny'], place_x, place_y)
-                    final_guides.append(fg)
-
+                # 2. Re-calculate bounds after rotation to normalize position
+                minx, miny, _, _ = poly.bounds
+                
+                # 3. Apply Translation (Move to 0,0 then to place_x, place_y)
+                # We simply subtract minx, miny (to zero it) and add place_x, place_y
+                dx = place_x - minx
+                dy = place_y - miny
+                
+                poly = affinity.translate(poly, xoff=dx, yoff=dy)
+                guides = [affinity.translate(g, xoff=dx, yoff=dy) for g in guides]
+                
                 # --- PLOT ---
                 
-                # Draw Main Shape (Solid)
+                # Draw Main Shape
                 if poly.geom_type == 'Polygon':
                     x, y = poly.exterior.xy
                     ax.plot(x, y, color='black', linewidth=0.8)
                 else:
-                    # Handle MultiPolygon just in case
                     for geom in poly.geoms:
                          x, y = geom.exterior.xy
                          ax.plot(x, y, color='black', linewidth=0.8)
 
                 # Draw Guides (Dashed)
-                for fg in final_guides:
+                for fg in guides:
                     if fg.geom_type == 'Polygon':
                         gx, gy = fg.exterior.xy
                         ax.plot(gx, gy, color='gray', linestyle='--', linewidth=0.5)
@@ -274,10 +242,13 @@ def main():
                         for geom in fg.geoms:
                             gx, gy = geom.exterior.xy
                             ax.plot(gx, gy, color='gray', linestyle='--', linewidth=0.5)
+                    elif fg.geom_type == 'GeometryCollection':
+                        for geom in fg.geoms:
+                            if geom.geom_type in ['Polygon', 'MultiPolygon']:
+                                gx, gy = geom.exterior.xy
+                                ax.plot(gx, gy, color='gray', linestyle='--', linewidth=0.5)
 
                 centroid = poly.centroid
-                
-                # Label & Arrow
                 ax.text(centroid.x, centroid.y - 2, f"{int(shape_data['elev'])}", fontsize=6, ha='center', va='top', color='red')
                 ax.arrow(centroid.x, centroid.y, n_vec[0]*4, n_vec[1]*4, head_width=1.5, head_length=1.5, fc='red', ec='red', linewidth=0.5)
                 
